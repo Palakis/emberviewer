@@ -27,9 +27,31 @@ streams, rebuilt from the protocol up, with a few quality-of-life additions.
 - **Matrices** - crosspoint grid with device-resolved source/target labels, click to route, configurable orientation, and a signal-parameters popup.
 - **Functions** - argument form, invoke, rendered result.
 - **Streams / meters** - `StreamFormat`-aware decode; a vertical meter for the selected parameter, plus pop-out windows.
+- **Snapshots** - save the values of selected branches to a JSON file and write them back later (see below).
 - **Server mode** - serve the UI to phones/laptops on your LAN; token-protected, with read-only and open-LAN modes (see below).
 - **Discovery** - find providers via mDNS (`_ember._tcp`).
 - **More** - per-parameter change logging (window or file), dark/light theme, an opt-in safety lock against accidental edits, a TX/RX traffic counter, and robust transport (keep-alive, reconnect with backoff, multi-package S101 reassembly).
+
+## Snapshots
+
+Save the state of a device - all of it, or the parts you care about - and put it back later: a
+show preset, a known-good configuration before you experiment, or the same setup copied onto a
+second device.
+
+**Save:** *Snapshot → Save…* (or right-click a node → *Snapshot this branch…*), tick the branches
+you want, then **Save…**. The app reads whatever part of the tree it has not walked yet, so a
+collapsed branch is still captured in full. Read-only parameters, triggers and streams are left out
+by default - a restore cannot write them.
+
+**Restore:** *Snapshot → Restore…* and pick the file. Every captured parameter is stored with its
+full path **from the device root**, so there is no root to choose: the app locates each one by
+identifier (falling back to its number, which makes a renumbered tree still match) and shows the
+saved value next to the live one, marked *changes*, *same*, *read-only* or *not found*. Tick the
+rows you want and hit **Apply** - a partial restore is just a smaller selection. Writes are paced in
+small batches so an embedded device is not flooded, and **Verify** reads the values back.
+
+Snapshots are plain JSON (provider, address, capture time, then the element tree), so they diff and
+version-control cleanly.
 
 ## Update check
 

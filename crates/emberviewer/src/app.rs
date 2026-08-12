@@ -17,6 +17,8 @@ use crate::model::{format_value, label_fetch_step, TreeModel, LABEL_FETCH_RETRY_
 use crate::net::{ConnectionHandle, NetCommand, NetEvent};
 use crate::server::{self, ServerHandle};
 use crate::settings::{OrderBy, Settings, StartupMode};
+use crate::snapshot::Snapshot;
+use crate::snapshot_view::{RestoreWindow, SaveAction, SaveWindow};
 use crate::widgets::{
     clean_multiline, display_value, draw_indicator, draw_vmeter, format_suffix, is_meterable,
     lock_toggle, lockable, meter_range, meter_readout, render_function, slider_should_send,
@@ -80,6 +82,10 @@ struct Session {
     /// egui time a slider last sent a `SetValue` while being dragged, keyed by
     /// path - throttles the flood of sets a fast drag would otherwise produce.
     slider_last_sent: HashMap<Vec<u32>, f64>,
+    /// Open "save a snapshot" window (branch selection), if any.
+    save_snapshot: Option<SaveWindow>,
+    /// Open "restore a snapshot" window (a loaded file), if any.
+    restore_snapshot: Option<RestoreWindow>,
 }
 
 /// TX/RX rates toward a device: bytes and S101 frames per second, each way.
@@ -503,6 +509,8 @@ impl App {
                 traffic_t: 0.0,
                 rate: TrafficRate::default(),
                 slider_last_sent: HashMap::new(),
+                save_snapshot: None,
+                restore_snapshot: None,
             },
         );
         self.active = Some(id);
@@ -830,6 +838,141 @@ impl App {
         }
     }
 
+    /// Open the "save a snapshot" window for the active provider. `branch`
+    /// preselects one branch of the tree.
+    fn open_snapshot_window(&mut self, branch: Option<Vec<u32>>) {
+        if let Some(session) = self.active.and_then(|id| self.sessions.get_mut(&id)) {
+            session.save_snapshot = Some(SaveWindow::new(branch));
+        }
+    }
+
+    /// Pick a snapshot file and open the restore window for it.
+    fn load_snapshot(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Restore snapshot")
+            .add_filter("Snapshot", &[crate::snapshot::EXTENSION])
+            .pick_file()
+        else {
+            return;
+        };
+        let source = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match Snapshot::load_from(&path) {
+            Ok(snapshot) => {
+                let count = snapshot.len();
+                if let Some(session) = self.active.and_then(|id| self.sessions.get_mut(&id)) {
+                    session.restore_snapshot = Some(RestoreWindow::new(snapshot, source.clone()));
+                }
+                self.status_line = format!("loaded {count} value(s) from {source}");
+            }
+            Err(e) => self.status_line = format!("snapshot load failed: {e}"),
+        }
+    }
+
+    /// Draw the snapshot windows of the active provider, and send what they ask
+    /// for: directory requests while they read the tree, and the values of a
+    /// restore.
+    fn snapshot_windows(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.active else {
+            return;
+        };
+        // The safety lock gates a restore, as it gates every other write.
+        let armed = self.edits_armed();
+        let Some(session) = self.sessions.get_mut(&id) else {
+            return;
+        };
+        let mut commands: Vec<NetCommand> = Vec::new();
+        let mut request: Option<(Vec<Vec<u32>>, bool)> = None;
+        let (mut close_save, mut close_restore) = (false, false);
+
+        if let Some(window) = &mut session.save_snapshot {
+            if let SaveAction::Save {
+                branches,
+                with_read_only,
+            } = window.show(ctx, &session.tree, &session.name, &mut commands)
+            {
+                request = Some((branches, with_read_only));
+            }
+            close_save = !window.open;
+        }
+        let mut writes: Vec<(Vec<u32>, Value)> = Vec::new();
+        if let Some(window) = &mut session.restore_snapshot {
+            writes = window.show(
+                ctx,
+                &session.tree,
+                &session.name,
+                &session.addr,
+                armed,
+                &mut commands,
+            );
+            close_restore = !window.open;
+        }
+        if close_save {
+            session.save_snapshot = None;
+        }
+        if close_restore {
+            session.restore_snapshot = None;
+        }
+        for (path, value) in writes {
+            // The value is optimistic until the device reports it back.
+            session.pending.insert(path.clone());
+            commands.push(NetCommand::SetValue(path, value));
+        }
+        for cmd in commands {
+            session.handle.send(cmd);
+        }
+
+        if let Some((branches, with_read_only)) = request {
+            self.write_snapshot(id, &branches, with_read_only);
+        }
+    }
+
+    /// Capture the branches of a session and write them to a file that the
+    /// operator selects.
+    fn write_snapshot(&mut self, id: Id, branches: &[Vec<u32>], with_read_only: bool) {
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
+        let snapshot = Snapshot::capture(
+            &session.tree,
+            branches,
+            &session.name,
+            &session.addr,
+            with_read_only,
+        );
+        let count = snapshot.len();
+        let stamp: String = snapshot
+            .created
+            .chars()
+            .filter(char::is_ascii_digit)
+            .take(12)
+            .collect();
+        let name = format!(
+            "{}-{stamp}.{}",
+            file_slug(&session.name),
+            crate::snapshot::EXTENSION
+        );
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Save snapshot")
+            .add_filter("Snapshot", &[crate::snapshot::EXTENSION])
+            .set_file_name(name)
+            .save_file()
+        else {
+            return;
+        };
+        match snapshot.save_to(&path) {
+            Ok(()) => {
+                self.status_line = format!("saved {count} value(s) to {}", path.display());
+                if let Some(session) = self.sessions.get_mut(&id) {
+                    session.save_snapshot = None;
+                }
+            }
+            Err(e) => self.status_line = format!("snapshot save failed: {e}"),
+        }
+    }
+
     /// Append a log entry to the buffer and (if configured) the log file.
     fn push_log(&mut self, entry: LogEntry) {
         let path = self.settings.log_file.trim();
@@ -878,6 +1021,26 @@ fn open_log_folder(path: &str) {
     #[cfg(all(unix, not(target_os = "macos")))]
     let prog = "xdg-open";
     let _ = std::process::Command::new(prog).arg(&dir).spawn();
+}
+
+/// A provider name that is safe in a file name.
+fn file_slug(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = mapped.trim_matches('-');
+    if trimmed.is_empty() {
+        "snapshot".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Status-bar traffic readout: bit rate and packet rate each way.
@@ -979,6 +1142,29 @@ impl eframe::App for App {
                         ui.close();
                     }
                 });
+                let connected = self.active.and_then(|id| self.sessions.get(&id)).is_some();
+                ui.menu_button("Snapshot", |ui| {
+                    if !connected {
+                        ui.weak("Open a provider first.");
+                        return;
+                    }
+                    if ui
+                        .button("Save…")
+                        .on_hover_text("Select branches of this tree and save their values")
+                        .clicked()
+                    {
+                        self.open_snapshot_window(None);
+                        ui.close();
+                    }
+                    if ui
+                        .button("Restore…")
+                        .on_hover_text("Load a snapshot file and write its values back")
+                        .clicked()
+                    {
+                        self.load_snapshot();
+                        ui.close();
+                    }
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let about_btn = ui.selectable_label(self.show_about, "About");
                     if about_btn.clicked() {
@@ -1037,6 +1223,7 @@ impl eframe::App for App {
         self.about_window(&ctx);
         self.signal_params_window(&ctx);
         self.string_edit_window(&ctx);
+        self.snapshot_windows(&ctx);
         self.discovery_window(&ctx);
         self.tabs(ui);
 
@@ -2616,6 +2803,7 @@ fn render_entry(
             heading = heading.weak().italics();
         }
         let mut name_clicked = false;
+        let mut snapshot_branch = false;
         let mut header =
             egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
                 .show_header(ui, |ui| {
@@ -2624,9 +2812,23 @@ fn render_entry(
                     let label = ui
                         .add(egui::Label::new(heading).sense(egui::Sense::click()))
                         .on_hover_text(if eff_online { "" } else { "offline" });
-                    label.context_menu(|ui| context_copy(ui, path, &identifier));
+                    label.context_menu(|ui| {
+                        context_copy(ui, path, &identifier);
+                        ui.separator();
+                        if ui
+                            .button("Snapshot this branch…")
+                            .on_hover_text("Save the values below this node to a file")
+                            .clicked()
+                        {
+                            snapshot_branch = true;
+                            ui.close();
+                        }
+                    });
                     name_clicked = label.clicked();
                 });
+        if snapshot_branch {
+            session.save_snapshot = Some(SaveWindow::new(Some(path.to_vec())));
+        }
         if name_clicked {
             header.toggle();
         }

@@ -23,6 +23,10 @@ mod server;
 #[cfg(not(target_arch = "wasm32"))]
 mod settings;
 #[cfg(not(target_arch = "wasm32"))]
+mod snapshot;
+#[cfg(not(target_arch = "wasm32"))]
+mod snapshot_view;
+#[cfg(not(target_arch = "wasm32"))]
 mod update;
 #[cfg(target_arch = "wasm32")]
 mod web;
