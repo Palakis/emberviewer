@@ -2645,8 +2645,14 @@ impl App {
                     let session = &self.sessions[id];
                     let selected = self.active == Some(*id);
                     paint_dot(ui, status_color(Some(&session.status)));
-                    if ui.selectable_label(selected, &session.name).clicked() {
+                    let label = ui
+                        .selectable_label(selected, &session.name)
+                        .on_hover_text("Middle-click to disconnect");
+                    if label.clicked() {
                         activate = Some(*id);
+                    }
+                    if label.middle_clicked() {
+                        disconnect = Some(*id);
                     }
                     if ui.small_button("✖").on_hover_text("Disconnect").clicked() {
                         disconnect = Some(*id);
