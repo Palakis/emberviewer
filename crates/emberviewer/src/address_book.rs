@@ -279,13 +279,26 @@ impl AddressBook {
         Self::remove_from(&mut self.root, id)
     }
 
-    /// Moves the node with `id` to become a child of `new_parent`.
+    /// Moves the node with `id` to become the last child of `new_parent`.
     ///
     /// Returns `true` on success. Fails (returning `false`, leaving the tree
     /// unchanged) if: the node does not exist, the new parent does not exist or
     /// is not a folder, or the move would place a folder inside itself or one of
     /// its own descendants.
     pub fn move_node(&mut self, id: Id, new_parent: Id) -> bool {
+        self.move_node_to(id, new_parent, usize::MAX)
+    }
+
+    /// Moves the node with `id` to become a child of `new_parent` at sibling
+    /// position `index` (clamped to the resulting number of siblings, so
+    /// `usize::MAX` means "append at the end").
+    ///
+    /// `index` is interpreted against `new_parent`'s children as they are
+    /// *before* the move, so it works both for reordering within the node's
+    /// current parent and for placing it among a different parent's children.
+    ///
+    /// Same failure conditions as [`Self::move_node`].
+    pub fn move_node_to(&mut self, id: Id, new_parent: Id, index: usize) -> bool {
         if id == Self::ROOT_ID {
             return false;
         }
@@ -297,6 +310,12 @@ impl AddressBook {
         if self.folder_mut(new_parent).is_none() {
             return false;
         }
+        // If `id` is already a child of `new_parent`, remember where, so the
+        // removal below (which shifts later siblings down by one) doesn't
+        // throw off the requested index.
+        let original_index = self
+            .folder_mut(new_parent)
+            .and_then(|f| f.children.iter().position(|c| c.id() == id));
         let node = match Self::remove_from(&mut self.root, id) {
             Some(n) => n,
             None => return false,
@@ -305,7 +324,14 @@ impl AddressBook {
         let parent = self
             .folder_mut(new_parent)
             .expect("destination validated above");
-        parent.children.push(node);
+        let mut index = index;
+        if let Some(original_index) = original_index {
+            if index > original_index {
+                index -= 1;
+            }
+        }
+        let index = index.min(parent.children.len());
+        parent.children.insert(index, node);
         true
     }
 
@@ -668,6 +694,65 @@ mod tests {
         // Move Routers to the root.
         assert!(ab.move_node(routers, AddressBook::ROOT_ID));
         assert_eq!(ab.root().children.len(), 3);
+    }
+
+    #[test]
+    fn move_node_to_reorders_within_same_folder() {
+        let mut ab = AddressBook::new();
+        let a = ab
+            .add_provider(AddressBook::ROOT_ID, "A", "h", DEFAULT_PORT, None)
+            .unwrap();
+        let b = ab
+            .add_provider(AddressBook::ROOT_ID, "B", "h", DEFAULT_PORT, None)
+            .unwrap();
+        let c = ab
+            .add_provider(AddressBook::ROOT_ID, "C", "h", DEFAULT_PORT, None)
+            .unwrap();
+        let ids = |ab: &AddressBook| {
+            ab.root()
+                .children
+                .iter()
+                .map(|n| n.id())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&ab), vec![a, b, c]);
+
+        // Drop A into the gap between B and C (index 2 in the pre-move list).
+        assert!(ab.move_node_to(a, AddressBook::ROOT_ID, 2));
+        assert_eq!(ids(&ab), vec![b, a, c]);
+
+        // Dropping a node back onto its own current slot is a no-op.
+        assert!(ab.move_node_to(a, AddressBook::ROOT_ID, 1));
+        assert_eq!(ids(&ab), vec![b, a, c]);
+
+        // Move C to the front.
+        assert!(ab.move_node_to(c, AddressBook::ROOT_ID, 0));
+        assert_eq!(ids(&ab), vec![c, b, a]);
+    }
+
+    #[test]
+    fn move_node_to_inserts_at_index_in_new_parent() {
+        let (mut ab, studio, mixer, routers, router1, _lab) = sample();
+        // Insert Mixer (currently a Studio A sibling of Routers) before Router 1.
+        assert!(ab.move_node_to(mixer, routers, 0));
+        let routers_folder = match ab.find(routers).unwrap() {
+            Node::Folder(f) => f,
+            _ => panic!(),
+        };
+        assert_eq!(
+            routers_folder
+                .children
+                .iter()
+                .map(Node::id)
+                .collect::<Vec<_>>(),
+            vec![mixer, router1]
+        );
+        // Studio A no longer has Mixer as a direct child.
+        let studio_folder = match ab.find(studio).unwrap() {
+            Node::Folder(f) => f,
+            _ => panic!(),
+        };
+        assert!(!studio_folder.children.iter().any(|n| n.id() == mixer));
     }
 
     #[test]

@@ -132,6 +132,22 @@ struct AddDialog {
 #[derive(Clone)]
 struct DragPayload(Id);
 
+/// Where, vertically, a drag pointer sits over an existing address-book row.
+/// Used to let each row double as a "reorder before/after me" drop target
+/// (the top/bottom edges) without allocating any extra layout space for
+/// separate gap widgets - which was tried first and turned out to visibly
+/// grow/reflow the whole tree by a few pixels per row the moment a drag
+/// started, disorienting to drag in a long, already-scrolled address book.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowZone {
+    /// Drop here to insert immediately before this row's node.
+    Before,
+    /// Drop here to insert immediately after this row's node.
+    After,
+    /// The row's own default drop behavior (e.g. "move into this folder").
+    Middle,
+}
+
 /// An action requested from the sidebar (right-click menu or drag-drop).
 enum SidebarAction {
     Open(Id),
@@ -140,7 +156,14 @@ enum SidebarAction {
     Remove(Id),
     AddFolder(Id),
     RenameFolder(Id),
-    Move { node: Id, into: Id },
+    /// Move `node` to become a child of `into`. `index` places it at a
+    /// specific sibling position (used for drag-to-reorder); `None` appends
+    /// it at the end (used when dropping directly onto a folder).
+    Move {
+        node: Id,
+        into: Id,
+        index: Option<usize>,
+    },
 }
 
 /// Draft state for the create/rename folder dialog.
@@ -1163,10 +1186,15 @@ impl App {
                 let filter = self.provider_filter.trim().to_lowercase();
                 let mut action = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for child in &root.children {
+                    if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
+                        Self::autoscroll_while_dragging(ui);
+                    }
+                    for (i, child) in root.children.iter().enumerate() {
                         Self::sidebar_node(
                             ui,
                             child,
+                            AddressBook::ROOT_ID,
+                            i,
                             &self.sessions,
                             self.active,
                             &mut action,
@@ -1193,6 +1221,7 @@ impl App {
                             action = Some(SidebarAction::Move {
                                 node: p.0,
                                 into: AddressBook::ROOT_ID,
+                                index: None,
                             });
                         }
                     }
@@ -1227,8 +1256,11 @@ impl App {
                     ..Default::default()
                 };
             }
-            Some(SidebarAction::Move { node, into }) => {
-                let moved = self.book.move_node(node, into);
+            Some(SidebarAction::Move { node, into, index }) => {
+                let moved = match index {
+                    Some(index) => self.book.move_node_to(node, into, index),
+                    None => self.book.move_node(node, into),
+                };
                 if moved {
                     let _ = self.book.save();
                 }
@@ -1237,12 +1269,65 @@ impl App {
         }
     }
 
+    /// While dragging in the address book, nudges the scroll position when
+    /// the pointer sits near the top or bottom edge of the visible list, so
+    /// a long, already-scrolled address book stays reachable without having
+    /// to let go of the drag partway through.
+    fn autoscroll_while_dragging(ui: &egui::Ui) {
+        const EDGE: f32 = 32.0;
+        const MAX_SPEED: f32 = 10.0;
+        let Some(pos) = ui.ctx().pointer_interact_pos() else {
+            return;
+        };
+        let rect = ui.clip_rect();
+        if !rect.contains(pos) {
+            return;
+        }
+        let dist_from_top = pos.y - rect.top();
+        let dist_from_bottom = rect.bottom() - pos.y;
+        let delta = if dist_from_top < EDGE {
+            -MAX_SPEED * (1.0 - dist_from_top / EDGE)
+        } else if dist_from_bottom < EDGE {
+            MAX_SPEED * (1.0 - dist_from_bottom / EDGE)
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            ui.scroll_with_delta(egui::vec2(0.0, -delta));
+            // The pointer may not move again on its own while it rests at
+            // the edge, so keep repainting or the scroll would stall there.
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Classifies where, if anywhere, the current drag pointer sits over
+    /// `row` - see [`RowZone`]. `None` if the pointer isn't over `row`.
+    fn row_drop_zone(ctx: &egui::Context, row: egui::Rect) -> Option<RowZone> {
+        let pos = ctx.pointer_interact_pos()?;
+        if !row.contains(pos) {
+            return None;
+        }
+        let band = (row.height() / 3.0).clamp(3.0, 8.0);
+        Some(if pos.y < row.top() + band {
+            RowZone::Before
+        } else if pos.y > row.bottom() - band {
+            RowZone::After
+        } else {
+            RowZone::Middle
+        })
+    }
+
     /// Render one address-book node (folder or provider) recursively.
+    /// `parent` and `index` are this node's own parent id and sibling
+    /// position, used to build "reorder before/after me" drop targets.
     /// When `filter` is non-empty, only matching providers (and folders with a
     /// matching descendant) are shown, with those folders force-expanded.
+    #[allow(clippy::too_many_arguments)]
     fn sidebar_node(
         ui: &mut egui::Ui,
         node: &Node,
+        parent: Id,
+        index: usize,
         sessions: &HashMap<Id, Session>,
         active: Option<Id>,
         action: &mut Option<SidebarAction>,
@@ -1259,32 +1344,67 @@ impl App {
                     header = header.open(Some(true));
                 }
                 let resp = header.show(ui, |ui| {
-                    for child in &folder.children {
-                        Self::sidebar_node(ui, child, sessions, active, action, filter);
+                    for (i, child) in folder.children.iter().enumerate() {
+                        Self::sidebar_node(
+                            ui, child, folder.id, i, sessions, active, action, filter,
+                        );
                     }
                 });
                 let hr = resp.header_response;
                 // Drop a dragged provider/folder onto this folder's row to move it
-                // inside. While a drag is in progress, make the whole header row a
-                // drop target with a highlight, instead of relying on the bare
-                // (narrow, unhighlighted) collapsing-header response.
+                // inside, or onto the row's top/bottom edge to reorder this folder
+                // among its own siblings instead. While a drag is in progress, make
+                // the whole header row a drop target with a highlight, instead of
+                // relying on the bare (narrow, unhighlighted) collapsing-header
+                // response.
                 if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
                     let row =
                         egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), hr.rect.y_range());
+                    let zone = Self::row_drop_zone(ui.ctx(), row);
+                    match zone {
+                        Some(RowZone::Before) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.top(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::After) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.bottom(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::Middle) => {
+                            ui.painter()
+                                .rect_filled(row, 4.0, ACCENT.gamma_multiply(0.22));
+                        }
+                        None => {}
+                    }
                     let drop = ui.interact(
                         row,
                         ui.make_persistent_id(("folder-drop", folder.id)),
                         egui::Sense::hover(),
                     );
-                    if drop.contains_pointer() {
-                        ui.painter()
-                            .rect_filled(row, 4.0, ACCENT.gamma_multiply(0.22));
-                    }
                     if let Some(p) = drop.dnd_release_payload::<DragPayload>() {
                         if p.0 != folder.id {
-                            *action = Some(SidebarAction::Move {
-                                node: p.0,
-                                into: folder.id,
+                            *action = Some(match zone {
+                                Some(RowZone::Before) => SidebarAction::Move {
+                                    node: p.0,
+                                    into: parent,
+                                    index: Some(index),
+                                },
+                                Some(RowZone::After) => SidebarAction::Move {
+                                    node: p.0,
+                                    into: parent,
+                                    index: Some(index + 1),
+                                },
+                                _ => SidebarAction::Move {
+                                    node: p.0,
+                                    into: folder.id,
+                                    index: None,
+                                },
                             });
                         }
                     }
@@ -1312,25 +1432,109 @@ impl App {
                 let connected = sessions.contains_key(&p.id);
                 let status = sessions.get(&p.id).map(|s| &s.status);
                 let selected = active == Some(p.id);
+                // Pinned to the provider's own id, and not the ambient call
+                // order, so this row's widget id stays stable regardless of
+                // what else is going on around it in the list.
                 let label_resp = ui
-                    .horizontal(|ui| {
-                        paint_dot(ui, status_color(status));
-                        // A label that senses click AND drag: click connects,
-                        // drag moves it, secondary-click opens the menu.
-                        let mut text = egui::RichText::new(&p.name);
-                        if selected {
-                            text = text.background_color(ui.visuals().selection.bg_fill);
-                        }
-                        ui.add(
-                            egui::Label::new(text)
-                                .selectable(false)
-                                .sense(egui::Sense::click_and_drag()),
-                        )
-                        .on_hover_text(format!("{}:{}", p.host, p.port))
+                    .push_id(("provider-row", p.id), |ui| {
+                        ui.horizontal(|ui| {
+                            paint_dot(ui, status_color(status));
+                            // A label that senses click AND drag: click connects,
+                            // drag moves it, secondary-click opens the menu.
+                            let mut text = egui::RichText::new(&p.name);
+                            if selected {
+                                text = text.background_color(ui.visuals().selection.bg_fill);
+                            }
+                            ui.add(
+                                egui::Label::new(text)
+                                    .selectable(false)
+                                    .sense(egui::Sense::click_and_drag()),
+                            )
+                            .on_hover_text(format!("{}:{}", p.host, p.port))
+                        })
+                        .inner
                     })
                     .inner;
                 if label_resp.dragged() {
                     label_resp.dnd_set_drag_payload(DragPayload(p.id));
+                }
+                // Drop onto this row's top/bottom edge to reorder relative to
+                // this provider - the same full-row-as-drop-target approach
+                // used for folders above, so a provider can be repositioned
+                // anywhere in the list (including within its own folder)
+                // without allocating extra space for separate gap widgets.
+                if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
+                    let row = egui::Rect::from_x_y_ranges(
+                        ui.max_rect().x_range(),
+                        label_resp.rect.y_range(),
+                    );
+                    let zone = Self::row_drop_zone(ui.ctx(), row);
+                    match zone {
+                        Some(RowZone::Before) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.top(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::After) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.bottom(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::Middle) | None => {}
+                    }
+                    let drop = ui.interact(
+                        row,
+                        ui.make_persistent_id(("provider-drop", p.id)),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(dragged) = drop.dnd_release_payload::<DragPayload>() {
+                        if dragged.0 != p.id {
+                            match zone {
+                                Some(RowZone::Before) => {
+                                    *action = Some(SidebarAction::Move {
+                                        node: dragged.0,
+                                        into: parent,
+                                        index: Some(index),
+                                    });
+                                }
+                                Some(RowZone::After) => {
+                                    *action = Some(SidebarAction::Move {
+                                        node: dragged.0,
+                                        into: parent,
+                                        index: Some(index + 1),
+                                    });
+                                }
+                                Some(RowZone::Middle) | None => {}
+                            }
+                        }
+                    }
+                }
+                // Nothing else moves with the cursor by default (the source
+                // row stays put), which makes it hard to tell a drag is even
+                // happening - so paint a small label that tracks the pointer
+                // for the whole drag. Gated on the drag-and-drop payload
+                // itself (which persists for the drag's duration) rather
+                // than `label_resp.dragged()`, which - for a widget sensing
+                // both click and drag - only pulses true on the single frame
+                // the drag starts.
+                if egui::DragAndDrop::payload::<DragPayload>(ui.ctx())
+                    .is_some_and(|payload| payload.0 == p.id)
+                {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        egui::Area::new(ui.id().with(("drag-ghost", p.id)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(pos + egui::vec2(12.0, 12.0))
+                            .interactable(false)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.label(&p.name);
+                                });
+                            });
+                    }
                 }
                 if label_resp.clicked() {
                     *action = Some(SidebarAction::Open(p.id));
