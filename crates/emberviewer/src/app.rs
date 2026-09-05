@@ -949,6 +949,17 @@ fn timestamp() -> String {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        // The main window and every popped-out meter run in one process and
+        // one event loop, so closing the main window would normally tear the
+        // whole thing down - including meters the user popped out precisely
+        // to keep watching. If any are open, cancel the close and minimize
+        // the main window instead, leaving the meters running.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.sessions.values().any(|s| !s.popped.is_empty())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
         // Apply the persisted theme on the first frame (and whenever it changes);
         // doing this in `ui()` rather than construction is what makes it stick.
         if self.applied_dark != Some(self.settings.dark_mode) {
@@ -2552,6 +2563,38 @@ impl App {
                     });
 
                     let area = ui.max_rect();
+                    // Small always-on-top pin (top-right, left of the ×) - a
+                    // quicker toggle than digging into the right-click menu.
+                    // Drawn, not a font glyph (those tofu in the default font).
+                    let pin_rect = egui::Rect::from_min_size(
+                        egui::pos2(area.right() - 35.0, area.top() + 1.0),
+                        egui::vec2(16.0, 16.0),
+                    );
+                    let pin_resp = ui
+                        .interact(pin_rect, ui.id().with("pin"), egui::Sense::click())
+                        .on_hover_text(if aot {
+                            "Always on top (click to unpin)"
+                        } else {
+                            "Click to keep on top of other windows"
+                        });
+                    let pin_col = if aot {
+                        ACCENT
+                    } else if pin_resp.hovered() {
+                        ui.visuals().weak_text_color()
+                    } else {
+                        ui.visuals().weak_text_color().gamma_multiply(0.55)
+                    };
+                    let pc = pin_rect.center();
+                    // A thumbtack: a round head with a point below it.
+                    ui.painter()
+                        .circle_filled(pc + egui::vec2(0.0, -2.0), 3.0, pin_col);
+                    ui.painter().line_segment(
+                        [pc + egui::vec2(0.0, 0.5), pc + egui::vec2(0.0, 5.0)],
+                        egui::Stroke::new(1.5_f32, pin_col),
+                    );
+                    if pin_resp.clicked() {
+                        toggle = true;
+                    }
                     // Faint × (top-right) to close - drawn, not a font glyph (those
                     // tofu in the default font). Brightens on hover.
                     let x_rect = egui::Rect::from_min_size(
