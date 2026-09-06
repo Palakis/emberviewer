@@ -2513,6 +2513,15 @@ impl App {
             ctx.show_viewport_deferred(vp_id, builder, move |ui, _class| {
                 render_popped_meter(ui, &state);
             });
+            // `Context::request_repaint()` (as called from the network hub
+            // when new data arrives) repaints whichever viewport happens to
+            // be "current" on the main thread at that moment - in practice
+            // almost always the root window, since a background thread has
+            // no reliable notion of which viewport is "current". Without
+            // this, a popped meter only repaints on its own input events
+            // (e.g. mouse-over), so it looked frozen the rest of the time
+            // even though we'd already refreshed its state above.
+            ctx.request_repaint_of(vp_id);
         }
         for i in to_close.into_iter().rev() {
             if i < session.popped.len() {
