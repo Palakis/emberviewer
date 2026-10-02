@@ -101,7 +101,38 @@ struct TrafficRate {
 /// values, or a red/green indicator light for booleans (chosen by value type).
 struct PoppedMeter {
     path: Vec<u32>,
+    /// Shared with the window's own deferred-viewport render callback (see
+    /// `popped_meters`), which can't borrow `&mut self`.
+    state: Arc<Mutex<PopMeterState>>,
+}
+
+/// Render input/output for one popped-out meter window, shared between the
+/// app (which refreshes the display fields from live session data every
+/// frame) and the window's own render callback (which reads them to draw,
+/// and writes `always_on_top`/`close_requested` back on user interaction).
+///
+/// Registered via `Context::show_viewport_deferred` rather than
+/// `show_viewport_immediate` specifically so the window keeps rendering
+/// (and so `always_on_top`/`close_requested` keep working) even on frames
+/// where the main window's own `ui()` doesn't run - e.g. while it's
+/// minimized. `show_viewport_immediate`'s callback runs inline as part of
+/// the caller's own pass, so it silently stops being shown the moment the
+/// caller (the main window) stops being called.
+#[derive(Default)]
+struct PopMeterState {
+    dev_name: String,
+    dev_addr: String,
+    title: String,
+    path_str: String,
+    description: Option<String>,
+    value: Option<f64>,
+    bool_value: Option<bool>,
+    range: (f64, f64),
+    /// Pre-formatted readout string (factor/format already applied), since
+    /// the render callback doesn't have access to the full protocol `Entry`.
+    readout: Option<String>,
     always_on_top: bool,
+    close_requested: bool,
 }
 
 /// One line in the change log.
@@ -138,6 +169,22 @@ struct AddDialog {
 #[derive(Clone)]
 struct DragPayload(Id);
 
+/// Where, vertically, a drag pointer sits over an existing address-book row.
+/// Used to let each row double as a "reorder before/after me" drop target
+/// (the top/bottom edges) without allocating any extra layout space for
+/// separate gap widgets - which was tried first and turned out to visibly
+/// grow/reflow the whole tree by a few pixels per row the moment a drag
+/// started, disorienting to drag in a long, already-scrolled address book.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowZone {
+    /// Drop here to insert immediately before this row's node.
+    Before,
+    /// Drop here to insert immediately after this row's node.
+    After,
+    /// The row's own default drop behavior (e.g. "move into this folder").
+    Middle,
+}
+
 /// An action requested from the sidebar (right-click menu or drag-drop).
 enum SidebarAction {
     Open(Id),
@@ -146,7 +193,14 @@ enum SidebarAction {
     Remove(Id),
     AddFolder(Id),
     RenameFolder(Id),
-    Move { node: Id, into: Id },
+    /// Move `node` to become a child of `into`. `index` places it at a
+    /// specific sibling position (used for drag-to-reorder); `None` appends
+    /// it at the end (used when dropping directly onto a folder).
+    Move {
+        node: Id,
+        into: Id,
+        index: Option<usize>,
+    },
 }
 
 /// Draft state for the create/rename folder dialog.
@@ -1087,6 +1141,18 @@ fn timestamp() -> String {
 }
 
 impl eframe::App for App {
+    /// Runs before `ui()` on every normal pass, but - unlike `ui()`, which
+    /// eframe skips whenever the root window isn't visible - also runs while
+    /// the main window is minimized, as long as something requests a
+    /// repaint (which incoming network events already do; see
+    /// `hub.rs`'s `ctx.request_repaint()`). Draining network events and
+    /// keeping popped-out meter windows registered both need to keep
+    /// happening in that case, so they live here rather than in `ui()`.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.pump_network();
+        self.popped_meters(ctx);
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         // Apply the persisted theme on the first frame (and whenever it changes);
@@ -1099,12 +1165,10 @@ impl eframe::App for App {
         if self.server.is_some() {
             self.refresh_catalog();
         }
-        self.pump_network();
         self.update_traffic(ctx.input(|i| i.time), &ctx);
         self.process_pulses(&ctx);
         self.poll_discovery(&ctx);
         self.poll_update_check(&ctx);
-        self.popped_meters(&ctx);
 
         egui::TopBottomPanel::top("menubar").show_inside(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1350,10 +1414,15 @@ impl App {
                 let filter = self.provider_filter.trim().to_lowercase();
                 let mut action = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    for child in &root.children {
+                    if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
+                        Self::autoscroll_while_dragging(ui);
+                    }
+                    for (i, child) in root.children.iter().enumerate() {
                         Self::sidebar_node(
                             ui,
                             child,
+                            AddressBook::ROOT_ID,
+                            i,
                             &self.sessions,
                             self.active,
                             &mut action,
@@ -1380,6 +1449,7 @@ impl App {
                             action = Some(SidebarAction::Move {
                                 node: p.0,
                                 into: AddressBook::ROOT_ID,
+                                index: None,
                             });
                         }
                     }
@@ -1414,8 +1484,11 @@ impl App {
                     ..Default::default()
                 };
             }
-            Some(SidebarAction::Move { node, into }) => {
-                let moved = self.book.move_node(node, into);
+            Some(SidebarAction::Move { node, into, index }) => {
+                let moved = match index {
+                    Some(index) => self.book.move_node_to(node, into, index),
+                    None => self.book.move_node(node, into),
+                };
                 if moved {
                     let _ = self.book.save();
                 }
@@ -1424,12 +1497,65 @@ impl App {
         }
     }
 
+    /// While dragging in the address book, nudges the scroll position when
+    /// the pointer sits near the top or bottom edge of the visible list, so
+    /// a long, already-scrolled address book stays reachable without having
+    /// to let go of the drag partway through.
+    fn autoscroll_while_dragging(ui: &egui::Ui) {
+        const EDGE: f32 = 32.0;
+        const MAX_SPEED: f32 = 10.0;
+        let Some(pos) = ui.ctx().pointer_interact_pos() else {
+            return;
+        };
+        let rect = ui.clip_rect();
+        if !rect.contains(pos) {
+            return;
+        }
+        let dist_from_top = pos.y - rect.top();
+        let dist_from_bottom = rect.bottom() - pos.y;
+        let delta = if dist_from_top < EDGE {
+            -MAX_SPEED * (1.0 - dist_from_top / EDGE)
+        } else if dist_from_bottom < EDGE {
+            MAX_SPEED * (1.0 - dist_from_bottom / EDGE)
+        } else {
+            0.0
+        };
+        if delta != 0.0 {
+            ui.scroll_with_delta(egui::vec2(0.0, -delta));
+            // The pointer may not move again on its own while it rests at
+            // the edge, so keep repainting or the scroll would stall there.
+            ui.ctx().request_repaint();
+        }
+    }
+
+    /// Classifies where, if anywhere, the current drag pointer sits over
+    /// `row` - see [`RowZone`]. `None` if the pointer isn't over `row`.
+    fn row_drop_zone(ctx: &egui::Context, row: egui::Rect) -> Option<RowZone> {
+        let pos = ctx.pointer_interact_pos()?;
+        if !row.contains(pos) {
+            return None;
+        }
+        let band = (row.height() / 3.0).clamp(3.0, 8.0);
+        Some(if pos.y < row.top() + band {
+            RowZone::Before
+        } else if pos.y > row.bottom() - band {
+            RowZone::After
+        } else {
+            RowZone::Middle
+        })
+    }
+
     /// Render one address-book node (folder or provider) recursively.
+    /// `parent` and `index` are this node's own parent id and sibling
+    /// position, used to build "reorder before/after me" drop targets.
     /// When `filter` is non-empty, only matching providers (and folders with a
     /// matching descendant) are shown, with those folders force-expanded.
+    #[allow(clippy::too_many_arguments)]
     fn sidebar_node(
         ui: &mut egui::Ui,
         node: &Node,
+        parent: Id,
+        index: usize,
         sessions: &HashMap<Id, Session>,
         active: Option<Id>,
         action: &mut Option<SidebarAction>,
@@ -1446,32 +1572,67 @@ impl App {
                     header = header.open(Some(true));
                 }
                 let resp = header.show(ui, |ui| {
-                    for child in &folder.children {
-                        Self::sidebar_node(ui, child, sessions, active, action, filter);
+                    for (i, child) in folder.children.iter().enumerate() {
+                        Self::sidebar_node(
+                            ui, child, folder.id, i, sessions, active, action, filter,
+                        );
                     }
                 });
                 let hr = resp.header_response;
                 // Drop a dragged provider/folder onto this folder's row to move it
-                // inside. While a drag is in progress, make the whole header row a
-                // drop target with a highlight, instead of relying on the bare
-                // (narrow, unhighlighted) collapsing-header response.
+                // inside, or onto the row's top/bottom edge to reorder this folder
+                // among its own siblings instead. While a drag is in progress, make
+                // the whole header row a drop target with a highlight, instead of
+                // relying on the bare (narrow, unhighlighted) collapsing-header
+                // response.
                 if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
                     let row =
                         egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), hr.rect.y_range());
+                    let zone = Self::row_drop_zone(ui.ctx(), row);
+                    match zone {
+                        Some(RowZone::Before) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.top(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::After) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.bottom(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::Middle) => {
+                            ui.painter()
+                                .rect_filled(row, 4.0, ACCENT.gamma_multiply(0.22));
+                        }
+                        None => {}
+                    }
                     let drop = ui.interact(
                         row,
                         ui.make_persistent_id(("folder-drop", folder.id)),
                         egui::Sense::hover(),
                     );
-                    if drop.contains_pointer() {
-                        ui.painter()
-                            .rect_filled(row, 4.0, ACCENT.gamma_multiply(0.22));
-                    }
                     if let Some(p) = drop.dnd_release_payload::<DragPayload>() {
                         if p.0 != folder.id {
-                            *action = Some(SidebarAction::Move {
-                                node: p.0,
-                                into: folder.id,
+                            *action = Some(match zone {
+                                Some(RowZone::Before) => SidebarAction::Move {
+                                    node: p.0,
+                                    into: parent,
+                                    index: Some(index),
+                                },
+                                Some(RowZone::After) => SidebarAction::Move {
+                                    node: p.0,
+                                    into: parent,
+                                    index: Some(index + 1),
+                                },
+                                _ => SidebarAction::Move {
+                                    node: p.0,
+                                    into: folder.id,
+                                    index: None,
+                                },
                             });
                         }
                     }
@@ -1499,25 +1660,109 @@ impl App {
                 let connected = sessions.contains_key(&p.id);
                 let status = sessions.get(&p.id).map(|s| &s.status);
                 let selected = active == Some(p.id);
+                // Pinned to the provider's own id, and not the ambient call
+                // order, so this row's widget id stays stable regardless of
+                // what else is going on around it in the list.
                 let label_resp = ui
-                    .horizontal(|ui| {
-                        paint_dot(ui, status_color(status));
-                        // A label that senses click AND drag: click connects,
-                        // drag moves it, secondary-click opens the menu.
-                        let mut text = egui::RichText::new(&p.name);
-                        if selected {
-                            text = text.background_color(ui.visuals().selection.bg_fill);
-                        }
-                        ui.add(
-                            egui::Label::new(text)
-                                .selectable(false)
-                                .sense(egui::Sense::click_and_drag()),
-                        )
-                        .on_hover_text(format!("{}:{}", p.host, p.port))
+                    .push_id(("provider-row", p.id), |ui| {
+                        ui.horizontal(|ui| {
+                            paint_dot(ui, status_color(status));
+                            // A label that senses click AND drag: click connects,
+                            // drag moves it, secondary-click opens the menu.
+                            let mut text = egui::RichText::new(&p.name);
+                            if selected {
+                                text = text.background_color(ui.visuals().selection.bg_fill);
+                            }
+                            ui.add(
+                                egui::Label::new(text)
+                                    .selectable(false)
+                                    .sense(egui::Sense::click_and_drag()),
+                            )
+                            .on_hover_text(format!("{}:{}", p.host, p.port))
+                        })
+                        .inner
                     })
                     .inner;
                 if label_resp.dragged() {
                     label_resp.dnd_set_drag_payload(DragPayload(p.id));
+                }
+                // Drop onto this row's top/bottom edge to reorder relative to
+                // this provider - the same full-row-as-drop-target approach
+                // used for folders above, so a provider can be repositioned
+                // anywhere in the list (including within its own folder)
+                // without allocating extra space for separate gap widgets.
+                if egui::DragAndDrop::has_payload_of_type::<DragPayload>(ui.ctx()) {
+                    let row = egui::Rect::from_x_y_ranges(
+                        ui.max_rect().x_range(),
+                        label_resp.rect.y_range(),
+                    );
+                    let zone = Self::row_drop_zone(ui.ctx(), row);
+                    match zone {
+                        Some(RowZone::Before) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.top(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::After) => {
+                            ui.painter().hline(
+                                row.x_range(),
+                                row.bottom(),
+                                egui::Stroke::new(2.0_f32, ACCENT),
+                            );
+                        }
+                        Some(RowZone::Middle) | None => {}
+                    }
+                    let drop = ui.interact(
+                        row,
+                        ui.make_persistent_id(("provider-drop", p.id)),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(dragged) = drop.dnd_release_payload::<DragPayload>() {
+                        if dragged.0 != p.id {
+                            match zone {
+                                Some(RowZone::Before) => {
+                                    *action = Some(SidebarAction::Move {
+                                        node: dragged.0,
+                                        into: parent,
+                                        index: Some(index),
+                                    });
+                                }
+                                Some(RowZone::After) => {
+                                    *action = Some(SidebarAction::Move {
+                                        node: dragged.0,
+                                        into: parent,
+                                        index: Some(index + 1),
+                                    });
+                                }
+                                Some(RowZone::Middle) | None => {}
+                            }
+                        }
+                    }
+                }
+                // Nothing else moves with the cursor by default (the source
+                // row stays put), which makes it hard to tell a drag is even
+                // happening - so paint a small label that tracks the pointer
+                // for the whole drag. Gated on the drag-and-drop payload
+                // itself (which persists for the drag's duration) rather
+                // than `label_resp.dragged()`, which - for a widget sensing
+                // both click and drag - only pulses true on the single frame
+                // the drag starts.
+                if egui::DragAndDrop::payload::<DragPayload>(ui.ctx())
+                    .is_some_and(|payload| payload.0 == p.id)
+                {
+                    if let Some(pos) = ui.ctx().pointer_interact_pos() {
+                        egui::Area::new(ui.id().with(("drag-ghost", p.id)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(pos + egui::vec2(12.0, 12.0))
+                            .interactable(false)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                    ui.label(&p.name);
+                                });
+                            });
+                    }
                 }
                 if label_resp.clicked() {
                     *action = Some(SidebarAction::Open(p.id));
@@ -2389,15 +2634,10 @@ impl App {
         // Device identity, shown on every pop-out so several stay distinguishable.
         let dev_name = session.name.clone();
         let dev_addr = session.addr.clone();
-        let items: Vec<(usize, Vec<u32>, bool)> = session
-            .popped
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i, p.path.clone(), p.always_on_top))
-            .collect();
         let mut to_close = Vec::new();
-        let mut to_toggle = Vec::new();
-        for (i, path, aot) in items {
+        for i in 0..session.popped.len() {
+            let path = session.popped[i].path.clone();
+            let state = Arc::clone(&session.popped[i].state);
             let Some(entry) = session.tree.get(&path).cloned() else {
                 continue;
             };
@@ -2418,20 +2658,34 @@ impl App {
                 .map(|n| n.to_string())
                 .collect::<Vec<_>>()
                 .join(".");
-            // Flank the meter with its identity so several open pop-outs stay
-            // distinguishable: device (name · host:port) reads up the left,
-            // parameter (name · path · description) reads up the right.
-            let left_text = format!("{dev_name}  ·  {dev_addr}");
-            let mut right_text = format!("{title}  ·  {path_str}");
-            if let Some(d) = entry.description.as_deref().filter(|d| !d.is_empty()) {
-                right_text.push_str("  ·  ");
-                right_text.push_str(d);
+            let readout = value.map(|v| meter_readout(&entry, v));
+
+            // Refresh the shared state the deferred render callback below
+            // reads from, and pick up anything it wrote back since we last
+            // ran (a pin/close click).
+            let (aot, close_requested) = {
+                let mut st = state.lock().unwrap();
+                st.dev_name = dev_name.clone();
+                st.dev_addr = dev_addr.clone();
+                st.title = title;
+                st.path_str = path_str;
+                st.description = entry.description.clone();
+                st.value = value;
+                st.bool_value = bool_value;
+                st.range = range;
+                st.readout = readout;
+                (st.always_on_top, st.close_requested)
+            };
+            if close_requested {
+                to_close.push(i);
+                continue;
             }
+
             let vp_id = egui::ViewportId::from_hash_of(("popmeter", id, &path));
             // Borderless floating window: no OS title bar / min-max-close chrome.
             // We provide drag-to-move and a right-click menu (close / pin) instead.
             let mut builder = egui::ViewportBuilder::default()
-                .with_title(format!("{title} - {dev_name}"))
+                .with_title(format!("{} - {dev_name}", entry.label()))
                 .with_decorations(false)
                 .with_resizable(true)
                 .with_inner_size([150.0, 300.0])
@@ -2439,170 +2693,22 @@ impl App {
             if aot {
                 builder = builder.with_always_on_top();
             }
-            let mut close = false;
-            let mut toggle = false;
-            ctx.show_viewport_immediate(vp_id, builder, |ctx, _| {
-                // A 1px border delineates the borderless window against the desktop.
-                let frame = egui::Frame::NONE
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::same(6))
-                    .stroke(ctx.style().visuals.window_stroke());
-                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                    let color = ui.visuals().text_color();
-                    let full_h = ui.available_height();
-                    let readout_h = if value.is_some() || bool_value.is_some() {
-                        22.0
-                    } else {
-                        0.0
-                    };
-                    let mh = (full_h - readout_h - 4.0).max(50.0);
-                    // Centre a fixed-width column (labels + meter) as one block so
-                    // the meter and the readout beneath it stay aligned at any
-                    // window width - `vertical_centered` alone would let the meter
-                    // row span full width (left-aligned) while centring the readout.
-                    const SIDE_W: f32 = 16.0;
-                    const METER_W: f32 = 40.0;
-                    const GAP: f32 = 2.0;
-                    let content_w = SIDE_W * 2.0 + METER_W + GAP * 2.0;
-                    let off = ((ui.available_width() - content_w) * 0.5).max(0.0);
-                    ui.horizontal(|ui| {
-                        ui.add_space(off);
-                        ui.vertical(|ui| {
-                            ui.set_width(content_w);
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = GAP;
-                                meter_side_label(ui, SIDE_W, mh, &left_text, color);
-                                if let Some(on) = bool_value {
-                                    draw_indicator(ui, Some(on), METER_W, mh);
-                                } else {
-                                    draw_vmeter(ui, value, range, METER_W, mh);
-                                }
-                                meter_side_label(ui, SIDE_W, mh, &right_text, color);
-                            });
-                            if let Some(v) = value {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(meter_readout(&entry, v));
-                                });
-                            } else if let Some(on) = bool_value {
-                                ui.vertical_centered(|ui| {
-                                    ui.label(if on { "true" } else { "false" });
-                                });
-                            }
-                        });
-                    });
-                    // Borderless interaction: the whole window is a drag handle (move
-                    // it like a title bar) and a right-click target (close / pin), with
-                    // a hover tooltip carrying the full, untruncated identity.
-                    let bg = ui.interact(
-                        ui.max_rect(),
-                        ui.id().with("winbg"),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if bg.drag_started_by(egui::PointerButton::Primary) {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                    }
-                    let mut tip = format!("{title}\n{dev_name}  ·  {dev_addr}\n{path_str}");
-                    if let Some(d) = entry.description.as_deref().filter(|d| !d.is_empty()) {
-                        tip.push('\n');
-                        tip.push_str(d);
-                    }
-                    bg.on_hover_text(tip).context_menu(|ui| {
-                        ui.label(egui::RichText::new(&title).strong());
-                        ui.label(
-                            egui::RichText::new(format!("{dev_name}  ·  {dev_addr}"))
-                                .small()
-                                .weak(),
-                        );
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("Drag the meter to move it")
-                                .small()
-                                .weak(),
-                        );
-                        let l = if aot {
-                            "Unpin (always on top)"
-                        } else {
-                            "Always on top"
-                        };
-                        if ui.button(l).clicked() {
-                            toggle = true;
-                            ui.close();
-                        }
-                        if ui.button("Close").clicked() {
-                            close = true;
-                            ui.close();
-                        }
-                    });
-
-                    let area = ui.max_rect();
-                    // Faint × (top-right) to close - drawn, not a font glyph (those
-                    // tofu in the default font). Brightens on hover.
-                    let x_rect = egui::Rect::from_min_size(
-                        egui::pos2(area.right() - 17.0, area.top() + 1.0),
-                        egui::vec2(16.0, 16.0),
-                    );
-                    let x_resp = ui
-                        .interact(x_rect, ui.id().with("close"), egui::Sense::click())
-                        .on_hover_text("Close");
-                    let x_col = if x_resp.hovered() {
-                        egui::Color32::from_rgb(220, 90, 80)
-                    } else {
-                        ui.visuals().weak_text_color().gamma_multiply(0.55)
-                    };
-                    let xc = x_rect.center();
-                    let xs = egui::Stroke::new(1.5_f32, x_col);
-                    ui.painter()
-                        .line_segment([xc + egui::vec2(-3.5, -3.5), xc + egui::vec2(3.5, 3.5)], xs);
-                    ui.painter()
-                        .line_segment([xc + egui::vec2(3.5, -3.5), xc + egui::vec2(-3.5, 3.5)], xs);
-                    if x_resp.clicked() {
-                        close = true;
-                    }
-
-                    // Bottom-right resize grip - borderless windows have no OS
-                    // resize border, so drag this to set the window's inner size.
-                    let g_rect = egui::Rect::from_min_size(
-                        area.right_bottom() - egui::vec2(14.0, 14.0),
-                        egui::vec2(14.0, 14.0),
-                    );
-                    let g_resp = ui
-                        .interact(g_rect, ui.id().with("grip"), egui::Sense::drag())
-                        .on_hover_cursor(egui::CursorIcon::ResizeNwSe);
-                    if g_resp.dragged() {
-                        let cur = ui.ctx().input(|i| i.screen_rect().size());
-                        let new = (cur + g_resp.drag_delta()).max(egui::vec2(104.0, 150.0));
-                        ui.ctx()
-                            .send_viewport_cmd(egui::ViewportCommand::InnerSize(new));
-                    }
-                    let g_col = ui
-                        .visuals()
-                        .weak_text_color()
-                        .gamma_multiply(if g_resp.hovered() { 1.0 } else { 0.6 });
-                    for off in [2.0, 6.0, 10.0] {
-                        ui.painter().line_segment(
-                            [
-                                egui::pos2(g_rect.right() - off, g_rect.bottom() - 1.5),
-                                egui::pos2(g_rect.right() - 1.5, g_rect.bottom() - off),
-                            ],
-                            egui::Stroke::new(1.0_f32, g_col),
-                        );
-                    }
-                });
-                if ctx.input(|i| i.viewport().close_requested()) {
-                    close = true;
-                }
+            // Deferred (not immediate): eframe invokes this independently of
+            // whether the main window's own `ui()` runs this pass, so the
+            // meter keeps rendering - and its pin/close stay live - even
+            // while the main window is minimized. See `PopMeterState`.
+            ctx.show_viewport_deferred(vp_id, builder, move |ui, _class| {
+                render_popped_meter(ui, &state);
             });
-            if close {
-                to_close.push(i);
-            }
-            if toggle {
-                to_toggle.push(i);
-            }
-        }
-        for i in to_toggle {
-            if let Some(p) = session.popped.get_mut(i) {
-                p.always_on_top = !p.always_on_top;
-            }
+            // `Context::request_repaint()` (as called from the network hub
+            // when new data arrives) repaints whichever viewport happens to
+            // be "current" on the main thread at that moment - in practice
+            // almost always the root window, since a background thread has
+            // no reliable notion of which viewport is "current". Without
+            // this, a popped meter only repaints on its own input events
+            // (e.g. mouse-over), so it looked frozen the rest of the time
+            // even though we'd already refreshed its state above.
+            ctx.request_repaint_of(vp_id);
         }
         for i in to_close.into_iter().rev() {
             if i < session.popped.len() {
@@ -2628,8 +2734,14 @@ impl App {
                     let session = &self.sessions[id];
                     let selected = self.active == Some(*id);
                     paint_dot(ui, status_color(Some(&session.status)));
-                    if ui.selectable_label(selected, &session.name).clicked() {
+                    let label = ui
+                        .selectable_label(selected, &session.name)
+                        .on_hover_text("Middle-click to disconnect");
+                    if label.clicked() {
                         activate = Some(*id);
+                    }
+                    if label.middle_clicked() {
+                        disconnect = Some(*id);
                     }
                     if ui.small_button("✖").on_hover_text("Disconnect").clicked() {
                         disconnect = Some(*id);
@@ -3022,7 +3134,7 @@ fn param_menu(
             if !session.popped.iter().any(|p| p.path == entry.path) {
                 session.popped.push(PoppedMeter {
                     path: entry.path.clone(),
-                    always_on_top: false,
+                    state: Arc::new(Mutex::new(PopMeterState::default())),
                 });
             }
             ui.close();
@@ -3385,6 +3497,220 @@ fn fetch_label_subtree(
         pending |= fetch_if_empty(session, &child);
     }
     pending
+}
+
+/// Draws one popped-out meter window's contents from its shared state (see
+/// `PopMeterState`) - the deferred-viewport render callback registered in
+/// `popped_meters`. Reads a snapshot of the display fields up front, then
+/// writes `close_requested`/`always_on_top` back into the shared state on
+/// interaction; `popped_meters` picks those up (and refreshes the display
+/// fields) the next time it runs.
+fn render_popped_meter(ui: &mut egui::Ui, state: &Arc<Mutex<PopMeterState>>) {
+    let (dev_name, dev_addr, title, path_str, description, value, bool_value, range, readout, aot) = {
+        let st = state.lock().unwrap();
+        (
+            st.dev_name.clone(),
+            st.dev_addr.clone(),
+            st.title.clone(),
+            st.path_str.clone(),
+            st.description.clone(),
+            st.value,
+            st.bool_value,
+            st.range,
+            st.readout.clone(),
+            st.always_on_top,
+        )
+    };
+    // Flank the meter with its identity so several open pop-outs stay
+    // distinguishable: device (name · host:port) reads up the left,
+    // parameter (name · path · description) reads up the right.
+    let left_text = format!("{dev_name}  ·  {dev_addr}");
+    let mut right_text = format!("{title}  ·  {path_str}");
+    if let Some(d) = description.as_deref().filter(|d| !d.is_empty()) {
+        right_text.push_str("  ·  ");
+        right_text.push_str(d);
+    }
+    // A 1px border delineates the borderless window against the desktop.
+    let frame = egui::Frame::NONE
+        .fill(ui.style().visuals.panel_fill)
+        .inner_margin(egui::Margin::same(6))
+        .stroke(ui.style().visuals.window_stroke());
+    egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        let color = ui.visuals().text_color();
+        let full_h = ui.available_height();
+        let readout_h = if value.is_some() || bool_value.is_some() {
+            22.0
+        } else {
+            0.0
+        };
+        let mh = (full_h - readout_h - 4.0).max(50.0);
+        // Centre a fixed-width column (labels + meter) as one block so
+        // the meter and the readout beneath it stay aligned at any
+        // window width - `vertical_centered` alone would let the meter
+        // row span full width (left-aligned) while centring the readout.
+        const SIDE_W: f32 = 16.0;
+        const METER_W: f32 = 40.0;
+        const GAP: f32 = 2.0;
+        let content_w = SIDE_W * 2.0 + METER_W + GAP * 2.0;
+        let off = ((ui.available_width() - content_w) * 0.5).max(0.0);
+        ui.horizontal(|ui| {
+            ui.add_space(off);
+            ui.vertical(|ui| {
+                ui.set_width(content_w);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = GAP;
+                    meter_side_label(ui, SIDE_W, mh, &left_text, color);
+                    if let Some(on) = bool_value {
+                        draw_indicator(ui, Some(on), METER_W, mh);
+                    } else {
+                        draw_vmeter(ui, value, range, METER_W, mh);
+                    }
+                    meter_side_label(ui, SIDE_W, mh, &right_text, color);
+                });
+                if let Some(r) = &readout {
+                    ui.vertical_centered(|ui| {
+                        ui.label(r);
+                    });
+                } else if let Some(on) = bool_value {
+                    ui.vertical_centered(|ui| {
+                        ui.label(if on { "true" } else { "false" });
+                    });
+                }
+            });
+        });
+        // Borderless interaction: the whole window is a drag handle (move
+        // it like a title bar) and a right-click target (close / pin), with
+        // a hover tooltip carrying the full, untruncated identity.
+        let bg = ui.interact(
+            ui.max_rect(),
+            ui.id().with("winbg"),
+            egui::Sense::click_and_drag(),
+        );
+        if bg.drag_started_by(egui::PointerButton::Primary) {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        let mut tip = format!("{title}\n{dev_name}  ·  {dev_addr}\n{path_str}");
+        if let Some(d) = description.as_deref().filter(|d| !d.is_empty()) {
+            tip.push('\n');
+            tip.push_str(d);
+        }
+        bg.on_hover_text(tip).context_menu(|ui| {
+            ui.label(egui::RichText::new(&title).strong());
+            ui.label(
+                egui::RichText::new(format!("{dev_name}  ·  {dev_addr}"))
+                    .small()
+                    .weak(),
+            );
+            ui.separator();
+            ui.label(
+                egui::RichText::new("Drag the meter to move it")
+                    .small()
+                    .weak(),
+            );
+            let l = if aot {
+                "Unpin (always on top)"
+            } else {
+                "Always on top"
+            };
+            if ui.button(l).clicked() {
+                state.lock().unwrap().always_on_top = !aot;
+                ui.close();
+            }
+            if ui.button("Close").clicked() {
+                state.lock().unwrap().close_requested = true;
+                ui.close();
+            }
+        });
+
+        let area = ui.max_rect();
+        // Small always-on-top pin (top-right, left of the ×) - a
+        // quicker toggle than digging into the right-click menu.
+        // Drawn, not a font glyph (those tofu in the default font).
+        let pin_rect = egui::Rect::from_min_size(
+            egui::pos2(area.right() - 35.0, area.top() + 1.0),
+            egui::vec2(16.0, 16.0),
+        );
+        let pin_resp = ui
+            .interact(pin_rect, ui.id().with("pin"), egui::Sense::click())
+            .on_hover_text(if aot {
+                "Always on top (click to unpin)"
+            } else {
+                "Click to keep on top of other windows"
+            });
+        let pin_col = if aot {
+            ACCENT
+        } else if pin_resp.hovered() {
+            ui.visuals().weak_text_color()
+        } else {
+            ui.visuals().weak_text_color().gamma_multiply(0.55)
+        };
+        let pc = pin_rect.center();
+        // A thumbtack: a round head with a point below it.
+        ui.painter()
+            .circle_filled(pc + egui::vec2(0.0, -2.0), 3.0, pin_col);
+        ui.painter().line_segment(
+            [pc + egui::vec2(0.0, 0.5), pc + egui::vec2(0.0, 5.0)],
+            egui::Stroke::new(1.5_f32, pin_col),
+        );
+        if pin_resp.clicked() {
+            state.lock().unwrap().always_on_top = !aot;
+        }
+        // Faint × (top-right) to close - drawn, not a font glyph (those
+        // tofu in the default font). Brightens on hover.
+        let x_rect = egui::Rect::from_min_size(
+            egui::pos2(area.right() - 17.0, area.top() + 1.0),
+            egui::vec2(16.0, 16.0),
+        );
+        let x_resp = ui
+            .interact(x_rect, ui.id().with("close"), egui::Sense::click())
+            .on_hover_text("Close");
+        let x_col = if x_resp.hovered() {
+            egui::Color32::from_rgb(220, 90, 80)
+        } else {
+            ui.visuals().weak_text_color().gamma_multiply(0.55)
+        };
+        let xc = x_rect.center();
+        let xs = egui::Stroke::new(1.5_f32, x_col);
+        ui.painter()
+            .line_segment([xc + egui::vec2(-3.5, -3.5), xc + egui::vec2(3.5, 3.5)], xs);
+        ui.painter()
+            .line_segment([xc + egui::vec2(3.5, -3.5), xc + egui::vec2(-3.5, 3.5)], xs);
+        if x_resp.clicked() {
+            state.lock().unwrap().close_requested = true;
+        }
+
+        // Bottom-right resize grip - borderless windows have no OS
+        // resize border, so drag this to set the window's inner size.
+        let g_rect = egui::Rect::from_min_size(
+            area.right_bottom() - egui::vec2(14.0, 14.0),
+            egui::vec2(14.0, 14.0),
+        );
+        let g_resp = ui
+            .interact(g_rect, ui.id().with("grip"), egui::Sense::drag())
+            .on_hover_cursor(egui::CursorIcon::ResizeNwSe);
+        if g_resp.dragged() {
+            let cur = ui.ctx().input(|i| i.screen_rect().size());
+            let new = (cur + g_resp.drag_delta()).max(egui::vec2(104.0, 150.0));
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::InnerSize(new));
+        }
+        let g_col = ui
+            .visuals()
+            .weak_text_color()
+            .gamma_multiply(if g_resp.hovered() { 1.0 } else { 0.6 });
+        for off in [2.0, 6.0, 10.0] {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(g_rect.right() - off, g_rect.bottom() - 1.5),
+                    egui::pos2(g_rect.right() - 1.5, g_rect.bottom() - off),
+                ],
+                egui::Stroke::new(1.0_f32, g_col),
+            );
+        }
+    });
+    if ui.ctx().input(|i| i.viewport().close_requested()) {
+        state.lock().unwrap().close_requested = true;
+    }
 }
 
 /// Draw a `w`×`h` column holding `text` rotated 90° so it reads bottom-to-top,
